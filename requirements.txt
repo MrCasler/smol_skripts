@@ -1,0 +1,2 @@
+# Content Downloader Dependencies
+yt-dlp>=2024.0.0

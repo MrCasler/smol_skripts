@@ -1,0 +1,77 @@
+# --- Cursor IDE ---
+.cursor/
+.cursorignore
+.cursorrules
+*.cursorrules
+
+# --- Videos ---
+*.mp4
+*.m4v
+*.mov
+*.avi
+*.webm
+*.mkv
+*.m4a
+*.flv
+*.wmv
+*.3gp
+
+# --- Images ---
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
+*.heic
+*.bmp
+*.tiff
+*.tif
+*.ico
+*.svg
+
+# --- Secrets & credentials (security) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+cookies*.txt
+*cookies*
+credentials*
+secrets*
+*.secret
+*.token
+config.local.*
+*.credentials
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+.env/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# --- OS ---
+.DS_Store
+.DS_Store?
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# --- Logs & temp ---
+*.log
+*.tmp
+*.temp
+.cache/
+
+# --- Downloads (media from scripts) ---
+downloads/

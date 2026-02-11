@@ -1,0 +1,2 @@
+# Add one EFTA file ID per line (e.g. EFTA00024813 or 00024813)
+# Get IDs from the site search, or run fetch_file_list_selenium.py to populate this file.
