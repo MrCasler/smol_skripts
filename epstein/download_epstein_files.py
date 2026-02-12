@@ -2,15 +2,14 @@
 """
 Download files from justice.gov/epstein/
 
-Same idea as download_with_cookies / download_content:
-  1. Cookies: Load from cookies.json or cookies.txt (export from Brave or Firefox after visiting
-     justice.gov/epstein and passing age verification).
-  2. File list: Use file_ids.txt (one EFTA ID per line) — primary, reliable. Optional
-     search via the site may return 0 results due to Akamai bot protection.
-  3. Download: For each file ID, try datasets 1–10 and extensions; download on first hit.
+Flow:
+  1. Opens browser (Brave via Selenium) for age verification
+  2. Syncs cookies from the browser to a requests session
+  3. Uses file_ids.txt for the list of files to download
+  4. For each file ID: tries extensions until one returns a real file (not HTML), downloads it
 
-No Selenium required for downloading. Use fetch_file_list_selenium.py once to populate
-file_ids.txt if you don't have a list.
+The browser is only needed once for age verification. All downloads happen via
+the requests session (fast, parallel-ready).
 """
 
 import requests
@@ -18,555 +17,426 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import time
 import os
+import shutil
 from pathlib import Path
-from urllib.parse import urljoin, quote
+from urllib.parse import quote
 import re
 from typing import List, Dict, Optional
 import json
-import http.cookiejar
-from bs4 import BeautifulSoup
+
+# --- Selenium imports (for age verification only) ---
+try:
+    import ssl
+    import urllib.request
+    import certifi
+    _orig_urlopen = urllib.request.urlopen
+    _ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+    def _urlopen_with_certs(*args, **kwargs):
+        if "context" not in kwargs:
+            kwargs["context"] = _ssl_ctx
+        return _orig_urlopen(*args, **kwargs)
+    urllib.request.urlopen = _urlopen_with_certs
+except ImportError:
+    pass
+
+try:
+    import undetected_chromedriver as uc
+    try:
+        import undetected_chromedriver.patcher as _patcher_mod
+        _patcher_mod.urlopen = _urlopen_with_certs
+    except (AttributeError, ImportError, NameError):
+        pass
+    _HAS_UC = True
+except ImportError:
+    _HAS_UC = False
+
+try:
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.common.exceptions import TimeoutException, NoSuchElementException
+    _HAS_SELENIUM = True
+except ImportError:
+    _HAS_SELENIUM = False
+
+
+def find_brave_binary():
+    for path in [
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        "/Applications/Brave.app/Contents/MacOS/Brave Browser",
+        os.path.expanduser("~/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
+    ]:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _create_driver():
+    """Create a browser driver for age verification."""
+    if not _HAS_UC:
+        raise RuntimeError("undetected_chromedriver is required. Install: pip install undetected-chromedriver")
+
+    brave_path = find_brave_binary()
+    if brave_path:
+        print(f"Using Brave: {brave_path}")
+
+    uc_cache = Path.home() / "Library/Application Support/undetected_chromedriver"
+    import platform
+    if platform.machine() == "arm64" and uc_cache.exists():
+        shutil.rmtree(uc_cache, ignore_errors=True)
+
+    for attempt in range(3):
+        opts = uc.ChromeOptions()
+        if brave_path:
+            opts.binary_location = brave_path
+        try:
+            return uc.Chrome(options=opts, version_main=143)
+        except OSError as e:
+            if getattr(e, "errno", None) == 86 or "Bad CPU type" in str(e):
+                print(f"Attempt {attempt+1}: Wrong CPU arch, removing cache...")
+                shutil.rmtree(uc_cache, ignore_errors=True)
+                for item in (Path.home() / "Library/Application Support").glob("undetected_chromedriver*"):
+                    if item.is_dir():
+                        shutil.rmtree(item, ignore_errors=True)
+                time.sleep(1)
+                if attempt < 2:
+                    continue
+            raise
+    raise RuntimeError("Failed to create driver after retries")
+
+
+def get_cookies_via_browser(base_url: str) -> dict:
+    """
+    Open a browser, navigate to the site, handle age verification,
+    and return the cookies as a dict {name: value}.
+    """
+    if not _HAS_SELENIUM:
+        raise RuntimeError("Selenium is required. Install: pip install selenium")
+
+    print("\n--- Opening browser for age verification ---")
+    driver = _create_driver()
+
+    try:
+        driver.get(base_url)
+        time.sleep(2)
+
+        # Handle age verification
+        try:
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.XPATH, "//*[contains(text(), '18') or contains(text(), 'age')]"))
+            )
+            print("Age verification detected. Looking for 'Yes' button...")
+            try:
+                yes_btn = driver.find_element(By.XPATH, "//button[contains(text(), 'Yes') or contains(text(), 'yes')]")
+                yes_btn.click()
+                print("Clicked 'Yes'.")
+                time.sleep(2)
+            except NoSuchElementException:
+                try:
+                    yes_btn = driver.find_element(By.ID, "age-yes")
+                    yes_btn.click()
+                    time.sleep(2)
+                except NoSuchElementException:
+                    print("Could not auto-click. Please verify age in the browser.")
+                    input("Press Enter after verifying age...")
+        except TimeoutException:
+            print("No age verification prompt detected.")
+
+        # Handle CAPTCHA
+        if 'captcha' in driver.page_source.lower() or 'robot' in driver.page_source.lower():
+            print("CAPTCHA detected. Please solve it in the browser.")
+            input("Press Enter after solving CAPTCHA...")
+
+        time.sleep(2)
+
+        # Collect all cookies
+        cookies = {}
+        for c in driver.get_cookies():
+            cookies[c['name']] = c['value']
+
+        print(f"Got {len(cookies)} cookies from browser.")
+
+        # Save cookies to cookies_browser.json for future runs
+        cookie_list = driver.get_cookies()
+        cookies_path = Path(__file__).parent / "cookies_browser.json"
+        with open(cookies_path, "w") as f:
+            json.dump(cookie_list, f, indent=2)
+        print(f"Saved browser cookies to {cookies_path}")
+
+        return cookies
+
+    finally:
+        driver.quit()
+        print("Browser closed.\n")
+
 
 class EpsteinFileDownloader:
-    def __init__(self, base_url: str = "https://www.justice.gov/epstein/", cookies_file: Optional[str] = None, download_dir: Optional[Path] = None):
+    def __init__(self, base_url: str = "https://www.justice.gov/epstein/",
+                 download_dir: Optional[Path] = None):
         self.base_url = base_url
         self.session = requests.Session()
-        
-        # Setup retry strategy
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-        )
+
+        retry_strategy = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
         adapter = HTTPAdapter(max_retries=retry_strategy)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
-        
-        # Set headers to mimic a browser
+
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept': '*/*',
             'Accept-Language': 'en-US,en;q=0.5',
             'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
             'Referer': 'https://www.justice.gov/epstein/',
         })
-        
-        # Load cookies if provided
-        if cookies_file and os.path.exists(cookies_file):
-            self.load_cookies(cookies_file)
-        
-        # File extensions to test
+
+        # Extensions to test for each file (order: most common first)
         self.file_extensions = [
-            '.mp4', '.mov', '.flv', '.avi', '.mkv', '.wmv',  # Video
-            '.mp3', '.ogg', '.wav', '.m4a', '.flac',  # Audio
-            '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp',  # Images
-            '.txt', '.doc', '.docx', '.pdf', '.rtf',  # Documents
-            '.zip', '.rar', '.7z', '.tar', '.gz',  # Archives
-            '.csv', '.xls', '.xlsx',  # Spreadsheets
-            '.html', '.htm', '.xml',  # Web formats
+            '.pdf', '.mp4', '.mov', '.avi', '.wmv', '.m4v', '.webm', '.flv', '.mkv',
+            '.mp3', '.wav', '.m4a', '.ogg', '.flac', '.aac',
+            '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif', '.webp',
+            '.txt', '.doc', '.docx', '.rtf',
+            '.zip', '.rar', '.7z', '.gz',
+            '.csv', '.xls', '.xlsx',
         ]
-        
+
         self.download_dir = download_dir if download_dir is not None else Path("downloads")
         self.download_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Create subdirectories for each file type
         for ext in self.file_extensions:
-            folder_name = ext.lstrip('.')
-            (self.download_dir / folder_name).mkdir(exist_ok=True)
+            (self.download_dir / ext.lstrip('.')).mkdir(exist_ok=True)
 
-    def get_file_ids_from_file(self, path: str = "file_ids.txt") -> List[Dict]:
-        """Load file IDs from a text file (one per line: EFTA00024813 or 00024813)."""
-        file_ids = []
-        path = Path(path)
-        if not path.exists():
-            return file_ids
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if line.startswith("EFTA"):
-                    full_id = line
-                    id_num = line.replace("EFTA", "")
-                else:
-                    id_num = line
-                    full_id = f"EFTA{line}"
-                file_ids.append({"id": id_num, "full_id": full_id, "dataset": None})
-        return file_ids
-    
-    def load_cookies(self, cookies_file: str):
-        """
-        Load cookies from a Netscape format cookie file or JSON file.
-        """
+    def set_cookies(self, cookies: dict):
+        """Set cookies on the requests session (from browser)."""
+        for name, value in cookies.items():
+            self.session.cookies.set(name, value, domain=".justice.gov")
+        print(f"Set {len(cookies)} cookies on requests session.")
+
+    def load_cookies_from_file(self, path: str) -> bool:
+        """Load cookies from cookies_browser.json (saved by previous browser session)."""
         try:
-            if cookies_file.endswith('.txt'):
-                # Netscape format - try multiple parsing methods
-                try:
-                    jar = http.cookiejar.MozillaCookieJar(cookies_file)
-                    jar.load(ignore_discard=True, ignore_expires=True)
-                    self.session.cookies.update(jar)
-                    print(f"Loaded cookies from {cookies_file} (MozillaCookieJar)")
-                except Exception:
-                    # Manual parsing for Netscape format
-                    with open(cookies_file, 'r') as f:
-                        for line in f:
-                            line = line.strip()
-                            if line.startswith('#') or not line:
-                                continue
-                            parts = line.split('\t')
-                            if len(parts) >= 7:
-                                domain = parts[0]
-                                domain_specified = parts[1] == 'TRUE'
-                                path = parts[2]
-                                secure = parts[3] == 'TRUE'
-                                expires = parts[4]
-                                name = parts[5]
-                                value = parts[6] if len(parts) > 6 else ''
-                                
-                                # Add cookie to session
-                                self.session.cookies.set(name, value, domain=domain, path=path)
-                    print(f"Loaded cookies from {cookies_file} (manual parsing)")
-            elif cookies_file.endswith('.json'):
-                # JSON format
-                with open(cookies_file, 'r') as f:
-                    cookies = json.load(f)
-                    if isinstance(cookies, list):
-                        for cookie in cookies:
-                            domain = cookie.get('domain', '.justice.gov')
-                            if not domain.startswith('.'):
-                                domain = '.' + domain.lstrip('.')
-                            self.session.cookies.set(
-                                cookie['name'], 
-                                cookie['value'], 
-                                domain=domain,
-                                path=cookie.get('path', '/')
-                            )
-                    elif isinstance(cookies, dict):
-                        # Simple key-value format
-                        for name, value in cookies.items():
-                            self.session.cookies.set(name, value, domain='.justice.gov')
-                print(f"Loaded cookies from {cookies_file}")
+            with open(path, 'r') as f:
+                cookie_list = json.load(f)
+            for c in cookie_list:
+                domain = c.get('domain', '.justice.gov')
+                self.session.cookies.set(c['name'], c['value'], domain=domain, path=c.get('path', '/'))
+            print(f"Loaded {len(cookie_list)} cookies from {path}")
+            return True
         except Exception as e:
-            print(f"Warning: Could not load cookies from {cookies_file}: {e}")
-            import traceback
-            traceback.print_exc()
-    
-    def save_cookies(self, cookies_file: str = "cookies.txt"):
-        """
-        Save current session cookies to a file.
-        """
-        try:
-            jar = http.cookiejar.MozillaCookieJar(cookies_file)
-            for cookie in self.session.cookies:
-                jar.set_cookie(cookie)
-            jar.save(ignore_discard=True, ignore_expires=True)
-            print(f"Saved cookies to {cookies_file}")
-        except Exception as e:
-            print(f"Warning: Could not save cookies: {e}")
-    
-    def handle_age_verification(self) -> bool:
-        """
-        Handle the age verification page.
-        Returns True if successful, False otherwise.
-        """
-        try:
-            # First, try to access the main page
-            response = self.session.get(self.base_url)
-            
-            # Check if we need age verification
-            if 'age verification' in response.text.lower() or 'Are you 18' in response.text:
-                print("Age verification required. Attempting to verify...")
-                
-                # Look for the verification form
-                # The form typically has a "Yes" button or checkbox
-                # We'll try to submit the form with age verification
-                
-                # Try to find and submit the age verification form
-                # This might need to be adjusted based on the actual form structure
-                verification_data = {
-                    'age_verified': 'yes',
-                    'age': 'yes',
-                }
-                
-                # Try POST to the same URL or a verification endpoint
-                verify_response = self.session.post(self.base_url, data=verification_data, allow_redirects=True)
-                
-                if verify_response.status_code == 200:
-                    print("Age verification submitted.")
-                    return True
-            else:
-                print("No age verification required or already verified.")
-                return True
-                
-        except Exception as e:
-            print(f"Error during age verification: {e}")
+            print(f"Could not load cookies from {path}: {e}")
             return False
-    
-    def search_files(self, search_query: str = "No images produced", dataset: int = None, page: int = 1) -> Optional[Dict]:
-        """
-        Search for files matching the query.
-        Returns a dictionary with file IDs and metadata.
-        """
+
+    def verify_cookies_work(self) -> bool:
+        """Test if cookies allow access to actual files (not age verification page)."""
+        # Try a known file URL
+        test_url = f"{self.base_url}files/DataSet%208/EFTA00033115.mp4"
         try:
-            # First, get the main page to ensure we have proper cookies
-            response = self.session.get(self.base_url)
-            
-            # Parse HTML to find search form
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Try to find search input and form
-            search_input = soup.find('input', {'type': 'search'}) or soup.find('input', {'type': 'text', 'name': re.compile(r'search|q', re.I)})
-            
-            if search_input:
-                # Find the form
-                form = search_input.find_parent('form')
-                if form:
-                    form_action = form.get('action', '')
-                    form_method = form.get('method', 'get').lower()
-                    search_url = urljoin(self.base_url, form_action) if form_action else self.base_url
-                    
-                    # Prepare form data
-                    form_data = {}
-                    for input_field in form.find_all(['input', 'select']):
-                        name = input_field.get('name')
-                        if name:
-                            if input_field.get('type') == 'checkbox' or input_field.get('type') == 'radio':
-                                if input_field.get('checked'):
-                                    form_data[name] = input_field.get('value', 'on')
-                            else:
-                                form_data[name] = input_field.get('value', '')
-                    
-                    # Set search query
-                    search_input_name = search_input.get('name', 'q')
-                    form_data[search_input_name] = search_query
-                    
-                    if form_method == 'post':
-                        response = self.session.post(search_url, data=form_data, allow_redirects=True)
-                    else:
-                        response = self.session.get(search_url, params=form_data, allow_redirects=True)
-                else:
-                    # No form found, try direct search
-                    response = self.session.get(self.base_url, params={'q': search_query})
-            else:
-                # Try direct URL parameters
-                params = {'q': search_query}
-                response = self.session.get(self.base_url, params=params)
-            
-            response.raise_for_status()
-            
-            # Parse the HTML with BeautifulSoup
-            soup = BeautifulSoup(response.text, 'html.parser')
-            file_ids = []
-            
-            # Debug: Save HTML for inspection (only on first call)
-            debug_file = self.download_dir / "debug_search_page.html"
-            if not debug_file.exists():
-                with open(debug_file, 'w', encoding='utf-8') as f:
-                    f.write(response.text)
-                print(f"  Debug: Saved search page HTML to {debug_file}")
-            
-            # Look for file links and text containing EFTA IDs
-            # Pattern: EFTA00024813.pdf - DataSet 8
-            text_content = soup.get_text()
-            
-            # Find all EFTA IDs
-            pattern = r'EFTA(\d+)'
-            matches = re.findall(pattern, text_content)
-            
-            # Also look for links
-            links = soup.find_all('a', href=re.compile(r'EFTA\d+'))
-            for link in links:
-                href = link.get('href', '')
-                match = re.search(r'EFTA(\d+)', href)
-                if match:
-                    matches.append(match.group(1))
-            
-            # Extract dataset information from context
-            dataset_pattern = r'DataSet\s*(\d+)'
-            dataset_matches = re.findall(dataset_pattern, text_content)
-            
-            # Extract unique file IDs
-            seen = set()
-            for match in matches:
-                file_id = match
-                full_id = f"EFTA{file_id}"
-                
-                if full_id not in seen:
-                    seen.add(full_id)
-                    # Try to determine dataset from context
-                    dataset_num = dataset
-                    if dataset_num is None and dataset_matches:
-                        # Use the most common dataset number found
-                        dataset_num = int(dataset_matches[0]) if dataset_matches else None
-                    
-                    file_ids.append({
-                        'id': file_id,
-                        'full_id': full_id,
-                        'dataset': dataset_num or 8,  # Default to dataset 8
-                    })
-            
-            # Check for pagination
-            has_more = bool(soup.find('a', string=re.compile(r'next|Next', re.I)) or 
-                          soup.find('a', href=re.compile(r'page.*next', re.I)))
-            
-            if len(file_ids) == 0:
-                print(f"  Warning: No file IDs found on page. Response status: {response.status_code}")
-                print(f"  Response length: {len(response.text)} characters")
-                # Check if we got redirected or blocked
-                if '403' in response.text or 'Forbidden' in response.text:
-                    print("  ⚠️  Got 403 Forbidden - cookies may be invalid or expired")
-                if 'age verification' in response.text.lower():
-                    print("  ⚠️  Age verification page detected - need to verify age first")
-            
-            return {
-                'files': file_ids,
-                'total_results': len(file_ids),
-                'has_more': has_more,
-            }
-            
-        except Exception as e:
-            print(f"Error searching files: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
-    
-    def test_file_extension(self, file_id: str, dataset: int, extension: str) -> bool:
+            resp = self.session.head(test_url, allow_redirects=True, timeout=10)
+            ct = resp.headers.get('Content-Type', '').lower()
+            cl = int(resp.headers.get('Content-Length', '0') or '0')
+            # If it returns HTML (especially ~9KB), cookies aren't working
+            if 'text/html' in ct and cl < 50000:
+                return False
+            # If it returns video or large content, cookies work
+            if cl > 50000 or 'video' in ct or 'application/octet' in ct:
+                return True
+            return False
+        except Exception:
+            return False
+
+    @staticmethod
+    def get_file_ids_from_file(path: str = "file_ids.txt") -> List[Dict]:
+        """Load file IDs from file_ids.txt.
+        Formats: 'EFTA00024813.pdf - DataSet 8' or 'EFTA00024813' or '00024813'
+        """
+        file_ids = []
+        p = Path(path)
+        if not p.exists():
+            return file_ids
+        for line in p.read_text(encoding='utf-8').splitlines():
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            # Match: EFTA00024813.ext - DataSet N
+            m = re.match(r'EFTA(\d+)\.\w+\s*-\s*DataSet\s+(\d+)', line)
+            if m:
+                file_ids.append({"full_id": f"EFTA{m.group(1)}", "dataset": int(m.group(2))})
+                continue
+            # Match: EFTA00024813 (optionally with extension)
+            m = re.match(r'(EFTA\d+)', line)
+            if m:
+                file_ids.append({"full_id": m.group(1), "dataset": None})
+                continue
+            # Match: bare number
+            m = re.match(r'(\d+)', line)
+            if m:
+                file_ids.append({"full_id": f"EFTA{m.group(1)}", "dataset": None})
+        return file_ids
+
+    def test_extension(self, file_id: str, dataset: int, extension: str) -> bool:
         """
         Test if a file exists with the given extension.
-        Returns True if file exists (status 200), False otherwise.
+        Simple: GET first 2KB. If it's HTML → not a real file. If it's binary → real file.
         """
+        dataset_encoded = quote(f"DataSet {dataset}")
+        url = f"{self.base_url}files/{dataset_encoded}/{file_id}{extension}"
         try:
-            # URL format: https://www.justice.gov/epstein/files/DataSet%208/EFTA00033177.pdf
-            dataset_encoded = quote(f"DataSet {dataset}")
-            url = f"{self.base_url}files/{dataset_encoded}/{file_id}{extension}"
-            
-            # Use HEAD request first (faster, doesn't download content)
-            response = self.session.head(url, allow_redirects=True, timeout=10)
-            
-            # If HEAD doesn't work, try GET but only read headers
-            if response.status_code == 405:  # Method not allowed
-                response = self.session.get(url, stream=True, timeout=10)
-                response.close()
-            
-            # Check if file exists (200 OK) and is not an error page
-            if response.status_code == 200:
-                content_type = response.headers.get('Content-Type', '')
-                content_length = response.headers.get('Content-Length', '0')
-                
-                # Check if it's not an HTML error page
-                if 'text/html' not in content_type or int(content_length) > 10000:
-                    return True
-            
+            resp = self.session.get(url, headers={'Range': 'bytes=0-2047'}, stream=True, timeout=15)
+            if resp.status_code not in (200, 206):
+                return False
+            chunk = resp.content[:2048]
+            resp.close()
+            if not chunk or len(chunk) < 10:
+                return False
+            # Check if the content is an HTML page (age verification / 404 / error)
+            try:
+                text = chunk[:500].decode('utf-8', errors='ignore').lower().strip()
+                if text.startswith(('<!doctype', '<html', '<!html')) or '<html' in text[:200]:
+                    return False  # HTML error page
+            except:
+                pass  # Can't decode as text → it's binary → good
+            return True
+        except Exception:
             return False
-            
-        except Exception as e:
-            # Timeout or connection error - assume file doesn't exist
-            return False
-    
-    def find_file_type(self, file_id: str, dataset: int) -> Optional[str]:
+
+    def find_and_download(self, file_id: str, dataset: int) -> Optional[str]:
         """
-        Test different file extensions to find the correct one.
-        Returns the extension if found, None otherwise.
+        Try each extension for the file. On first real hit, download it.
+        Returns the extension on success, None on failure.
         """
-        print(f"  Testing file {file_id} in dataset {dataset}...")
-        
+        dataset_encoded = quote(f"DataSet {dataset}")
+
         for ext in self.file_extensions:
-            if self.test_file_extension(file_id, dataset, ext):
-                print(f"    Found: {ext}")
+            if not self.test_extension(file_id, dataset, ext):
+                continue
+
+            # Found a real file — download it
+            url = f"{self.base_url}files/{dataset_encoded}/{file_id}{ext}"
+            try:
+                resp = self.session.get(url, stream=True, timeout=60)
+                resp.raise_for_status()
+
+                # Double-check first chunk isn't HTML
+                first_chunk = next(resp.iter_content(chunk_size=4096), None)
+                if not first_chunk:
+                    continue
+                try:
+                    text = first_chunk[:500].decode('utf-8', errors='ignore').lower().strip()
+                    if text.startswith(('<!doctype', '<html')) or '<html' in text[:200]:
+                        resp.close()
+                        continue
+                except:
+                    pass
+
+                base_id = file_id if file_id.startswith("EFTA") else f"EFTA{file_id}"
+                filename = f"{base_id}{ext}"
+                save_path = self.download_dir / ext.lstrip('.') / filename
+                with open(save_path, 'wb') as f:
+                    f.write(first_chunk)
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+
+                print(f"    ✓ {filename} ({ext})")
                 return ext
-            time.sleep(0.1)  # Small delay to avoid rate limiting
-        
-            print(f"    No valid extension found for {file_id}")
+
+            except Exception as e:
+                print(f"    ✗ Error downloading {file_id}{ext}: {e}")
+                continue
+
+            time.sleep(0.05)
+
         return None
 
     def process_file_list(self, file_infos: List[Dict]) -> Dict:
-        """Process a list of file infos (from file_ids.txt or search). For each, try datasets 1-10 and extensions; download on first hit."""
-        stats = {"total_files": len(file_infos), "downloaded": 0, "failed": 0, "not_found": 0}
-        for file_info in file_infos:
-            full_id = file_info["full_id"]
-            dataset_hint = file_info.get("dataset")
+        """Process all files: for each, try the hinted dataset (or all 1-10), and all extensions."""
+        stats = {"total": len(file_infos), "downloaded": 0, "not_found": 0, "failed": 0}
+
+        for i, info in enumerate(file_infos, 1):
+            fid = info["full_id"]
+            ds_hint = info.get("dataset")
+            print(f"[{i}/{stats['total']}] {fid} (dataset hint: {ds_hint or 'none'})...")
+
             found = False
-            for dataset in range(1, 11):
-                if dataset_hint is not None and dataset != dataset_hint:
-                    continue
-                ext = self.find_file_type(full_id, dataset)
+            datasets_to_try = [ds_hint] if ds_hint else range(1, 11)
+            for ds in datasets_to_try:
+                ext = self.find_and_download(fid, ds)
                 if ext:
-                    if self.download_file(full_id, dataset, ext):
-                        stats["downloaded"] += 1
-                    else:
-                        stats["failed"] += 1
+                    stats["downloaded"] += 1
                     found = True
                     break
                 time.sleep(0.1)
+
             if not found:
                 stats["not_found"] += 1
-            time.sleep(0.5)
+                print(f"    — no valid file found")
+            time.sleep(0.3)
+
         return stats
-    
-    def download_file(self, file_id: str, dataset: int, extension: str) -> bool:
-        """
-        Download a file and save it to the appropriate folder.
-        """
-        try:
-            dataset_encoded = quote(f"DataSet {dataset}")
-            url = f"{self.base_url}files/{dataset_encoded}/{file_id}{extension}"
-            
-            response = self.session.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            
-            # Determine save path (file_id may be "EFTA00033177" or "00033177")
-            folder_name = extension.lstrip('.')
-            base_id = file_id if file_id.startswith("EFTA") else f"EFTA{file_id}"
-            filename = f"{base_id}{extension}"
-            save_path = self.download_dir / folder_name / filename
-            
-            # Download file
-            with open(save_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-            
-            print(f"    Downloaded: {save_path}")
-            return True
-            
-        except Exception as e:
-            print(f"    Error downloading {file_id}{extension}: {e}")
-            return False
-    
-    def process_dataset(self, dataset: int, max_pages: int = None) -> Dict:
-        """
-        Process all files in a dataset.
-        """
-        print(f"\nProcessing Dataset {dataset}...")
-        
-        stats = {
-            'total_files': 0,
-            'downloaded': 0,
-            'failed': 0,
-            'not_found': 0,
-        }
-        
-        page = 1
-        max_pages = max_pages or 1000  # Safety limit
-        
-        while page <= max_pages:
-            print(f"\n  Page {page}...")
-            
-            # Search for files
-            result = self.search_files("No images produced", dataset=dataset, page=page)
-            
-            if not result or not result['files']:
-                print(f"  No more files found on page {page}")
-                break
-            
-            files = result['files']
-            stats['total_files'] += len(files)
-            
-            # Process each file
-            for file_info in files:
-                file_id = file_info['id']
-                full_id = file_info['full_id']
-                
-                # Find the correct file extension
-                extension = self.find_file_type(full_id, dataset)
-                
-                if extension:
-                    # Download the file
-                    if self.download_file(full_id, dataset, extension):
-                        stats['downloaded'] += 1
-                    else:
-                        stats['failed'] += 1
-                else:
-                    stats['not_found'] += 1
-                
-                time.sleep(0.5)  # Rate limiting
-            
-            # Check if there are more pages
-            if not result.get('has_more', False):
-                break
-            
-            page += 1
-            time.sleep(1)  # Delay between pages
-        
-        return stats
-    
-    def run(self, datasets: List[int] = None, max_pages_per_dataset: int = None, file_ids_path: str = "file_ids.txt"):
-        """
-        Main execution: prefer file_ids.txt (like download_with_cookies flow), else try search.
-        """
-        print("Epstein Files Downloader (cookies + file list, same idea as download_with_cookies)")
-        print("Cookies: cookies.json or cookies.txt | File list: file_ids.txt (one EFTA ID per line)\n")
-        
-        if not self.handle_age_verification():
-            print("Warning: Age verification may have failed. Continuing anyway...")
-        self.save_cookies()
-        
-        # Primary path: file_ids.txt (reliable, no Akamai)
-        file_infos = self.get_file_ids_from_file(file_ids_path)
-        if file_infos:
-            print(f"Using file list: {file_ids_path} ({len(file_infos)} file IDs)\n")
-            stats = self.process_file_list(file_infos)
-            summary = {"file_list": stats}
-        elif Path(file_ids_path).exists():
-            print("file_ids.txt exists but has no IDs (only comments?). Add EFTA IDs or run fetch_file_list_selenium.py.\n")
-            summary = {}
-            stats = None
-        else:
-            # Fallback: search (often returns 0 due to Akamai bot protection)
-            print("No file_ids.txt (or empty). Trying site search — may return 0 results if Akamai blocks.\n")
-            datasets = datasets or list(range(1, 11))
-            all_stats = {}
-            for dataset in datasets:
-                stats = self.process_dataset(dataset, max_pages_per_dataset)
-                all_stats[f"Dataset {dataset}"] = stats
-                print(f"\nDataset {dataset} Summary: total={stats['total_files']} downloaded={stats['downloaded']} failed={stats['failed']} not_found={stats['not_found']}")
-                time.sleep(2)
-            summary = all_stats
-            stats = None
-        summary_path = self.download_dir / "download_summary.json"
-        with open(summary_path, "w") as f:
-            json.dump(summary, f, indent=2)
-        if stats is not None:
-            print(f"\nSummary: downloaded={stats['downloaded']} failed={stats['failed']} not_found={stats['not_found']}")
-        print(f"\nDone. Summary saved to {summary_path}")
 
 
 def main():
     print("=" * 60)
     print("Epstein Files Downloader")
     print("=" * 60)
-    print("1. Export cookies from Brave or Firefox (justice.gov/epstein, after age verification)")
-    print("   → Save as cookies.json or cookies.txt in this folder")
-    print("2. Add file IDs to file_ids.txt (one per line, e.g. EFTA00024813)")
-    print("   → Or run fetch_file_list_selenium.py once to populate from the site")
-    print("=" * 60)
-    
-    cookies_file = None
-    if os.path.exists("cookies.json"):
-        cookies_file = "cookies.json"
-    elif os.path.exists("cookies.txt"):
-        cookies_file = "cookies.txt"
-    else:
-        print("\nNo cookies.json or cookies.txt found. Downloads may get 403.")
-        print("Export cookies from the site and save here, then run again.\n")
-    
+
+    base_url = "https://www.justice.gov/epstein/"
     download_dir = Path(__file__).parent / "downloads"
-    downloader = EpsteinFileDownloader(cookies_file=cookies_file, download_dir=download_dir)
-    
+    downloader = EpsteinFileDownloader(base_url=base_url, download_dir=download_dir)
+
+    # --- Step 1: Get valid cookies ---
+    # Try saved browser cookies first
+    cookies_path = Path(__file__).parent / "cookies_browser.json"
+    have_cookies = False
+
+    if cookies_path.exists():
+        downloader.load_cookies_from_file(str(cookies_path))
+        print("Testing if saved cookies still work...")
+        if downloader.verify_cookies_work():
+            print("Saved cookies work! Skipping browser.\n")
+            have_cookies = True
+        else:
+            print("Saved cookies expired or invalid.\n")
+
+    if not have_cookies:
+        print("Need fresh cookies from browser (age verification required).")
+        cookies = get_cookies_via_browser(base_url)
+        downloader.set_cookies(cookies)
+        if downloader.verify_cookies_work():
+            print("Browser cookies verified — access works!\n")
+            have_cookies = True
+        else:
+            print("WARNING: Cookies from browser don't seem to work.")
+            print("The site may require specific cookies. Trying anyway...\n")
+
+    # --- Step 2: Load file IDs ---
     file_ids_path = Path(__file__).parent / "file_ids.txt"
     if not file_ids_path.exists():
         file_ids_path.write_text(
-            "# Add one EFTA file ID per line (e.g. EFTA00024813 or 00024813)\n"
-            "# Get IDs from the site search, or run fetch_file_list_selenium.py to populate this file.\n",
+            "# Add one EFTA file ID per line (e.g. EFTA00024813)\n"
+            "# Or run fetch_file_list_selenium.py to populate this file.\n",
             encoding="utf-8",
         )
-        print(f"Created {file_ids_path} — add your file IDs there, then run again.\n")
+        print(f"Created {file_ids_path} — add file IDs, then run again.")
         return
-    
-    downloader.run(file_ids_path=str(file_ids_path))
-    print("\nAll set.")
-    return
+
+    file_infos = downloader.get_file_ids_from_file(str(file_ids_path))
+    if not file_infos:
+        print("No file IDs found in file_ids.txt. Add IDs or run fetch_file_list_selenium.py.")
+        return
+
+    print(f"Loaded {len(file_infos)} file IDs from {file_ids_path}\n")
+
+    # --- Step 3: Download ---
+    stats = downloader.process_file_list(file_infos)
+
+    print(f"\n{'=' * 60}")
+    print(f"Done! Downloaded: {stats['downloaded']} | Not found: {stats['not_found']} | Failed: {stats['failed']}")
+    print(f"{'=' * 60}")
+
+    summary_path = download_dir / "download_summary.json"
+    with open(summary_path, "w") as f:
+        json.dump(stats, f, indent=2)
+    print(f"Summary saved to {summary_path}")
 
 
 if __name__ == "__main__":
