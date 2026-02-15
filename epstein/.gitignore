@@ -1,0 +1,35 @@
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Cookies and session data (do not commit)
+cookies_browser.json
+cookies.json
+cookies.txt
+*cookies*
+
+# Downloaded files
+downloads/
+
+# Generated file list (optional: remove this line if you want to track file_ids.txt)
+# file_ids.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+
+# Tests and tools
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE and logs
+.cursor/
+*.log
+.DS_Store
