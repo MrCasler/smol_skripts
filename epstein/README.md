@@ -5,6 +5,10 @@ Download PDFs from the U.S. Department of Justice Epstein document repository:
 
 The site requires age verification and uses cookies. This tool uses **Brave** (or Chrome) with Selenium to pass the gate once, then uses a Python `requests` session with those cookies for fast bulk downloads.
 
+Example of the kind of document imagery in the repository (contact sheet with redactions):
+
+![Sample document from the repository](assets/sample-document.png)
+
 ---
 
 ## Requirements
@@ -113,6 +117,6 @@ See `EXTRACT_COOKIES.md` if you want to use cookies in another tool.
 
 ---
 
-LICENSE
+## License
 
-MIT LICENSE
+MIT — see [LICENSE](LICENSE).
