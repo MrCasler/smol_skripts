@@ -113,5 +113,6 @@ See `EXTRACT_COOKIES.md` if you want to use cookies in another tool.
 
 ---
 
-  
+LICENSE
 
+MIT LICENSE
